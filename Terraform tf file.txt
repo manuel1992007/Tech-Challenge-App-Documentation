@@ -1,0 +1,338 @@
+##################################################################################
+# VARIABLES
+##################################################################################
+
+variable "database_name" {}
+variable "database_password" {}
+variable "database_user" {}
+variable "aws_access_key" {}
+variable "aws_secret_key" {}
+variable "private_key_path" {}
+variable "key_name" {}
+variable "region" {
+  default = "us-east-1"
+}
+
+##################################################################################
+# PROVIDERS
+##################################################################################
+
+provider "aws" {
+  access_key = var.aws_access_key
+  secret_key = var.aws_secret_key
+  region     = "us-east-1"
+}
+
+##################################################################################
+# DATA
+##################################################################################
+
+data "aws_availability_zones" "all" {}
+
+##################################################################################
+# RESOURCES
+##################################################################################
+
+# Create a VPC
+resource "aws_vpc" "tech-app-vpc" {
+  cidr_block = "10.0.0.0/16"
+  tags = {
+    Name = "Tech App VPC"
+  }
+}
+
+# Create Public Subnet for EC2 instances that host the Tech App application
+resource "aws_subnet" "app-subnet-1" {
+  vpc_id                  = aws_vpc.tech-app-vpc.id
+  cidr_block              = "10.0.0.0/24"
+  availability_zone       = "us-east-1a"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "Public Subnet us-east-1a"
+  }
+}
+
+# Create Public Subnet 2 for EC2 instances that host the Tech App application
+resource "aws_subnet" "app-subnet-2" {
+  vpc_id                  = aws_vpc.tech-app-vpc.id
+  cidr_block              = "10.0.1.0/24"
+  availability_zone       = "us-east-1b"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name = "Public Subnet us-east-1b"
+  }
+}
+
+# Create Database Private Subnet for the Postgres RDS. We create 2 DB subnets for Multi-AZ support for the RDS
+resource "aws_subnet" "database-subnet-1" {
+  vpc_id            = aws_vpc.tech-app-vpc.id
+  cidr_block        = "10.0.21.0/24"
+  availability_zone = "us-east-1a"
+
+  tags = {
+    Name = "Database-1a"
+  }
+}
+
+resource "aws_subnet" "database-subnet-2" {
+  vpc_id            = aws_vpc.tech-app-vpc.id
+  cidr_block        = "10.0.22.0/24"
+  availability_zone = "us-east-1b"
+
+  tags = {
+    Name = "Database-2b"
+  }
+}
+
+### Creating Security Group for EC2 Instances
+resource "aws_security_group" "tech-app-sg" {
+  name = "Security Group for Tech App hosting Instances"
+  ingress {
+    from_port = 80
+    to_port = 80
+    protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+### Creating EC2 instance
+resource "aws_instance" "tech-app-instance" {
+  ami               = "${lookup(var.amis,var.region)}"
+  key_name               = "${var.key_name}"
+  vpc_security_group_ids = ["${aws_security_group.tech-app-sg.id}"]
+  source_dest_check = false
+  instance_type = "t2.micro"
+}
+
+## Creating Launch Configuration
+resource "aws_launch_configuration" "tech-app-lc" {
+  image_id               = "${lookup(var.amis,var.region)}"
+  instance_type          = "t2.micro"
+  security_groups        = ["${aws_security_group.tech-app-sg.id}"]
+  key_name               = "${var.key_name}"
+  user_data = <<-EOF
+              #!/bin/bash -xe
+## Code Deploy Agent Bootstrap Script##
+
+exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+AUTOUPDATE=false
+
+function installdep(){
+
+if [ ${PLAT} = "ubuntu" ]; then
+
+  apt-get -y update
+  # Satisfying even ubuntu older versions.
+  apt-get -y install jq awscli ruby2.0 || apt-get -y install jq awscli ruby
+
+
+
+elif [ ${PLAT} = "amz" ]; then
+  yum -y update
+  yum install -y aws-cli ruby jq
+
+fi
+
+}
+
+function platformize(){
+
+#Linux OS detection#
+ if hash lsb_release; then
+   echo "Ubuntu server OS detected"
+   export PLAT="ubuntu"
+
+
+elif hash yum; then
+  echo "Amazon Linux detected"
+  export PLAT="amz"
+
+ else
+   echo "Unsupported release"
+   exit 1
+
+ fi
+}
+
+
+function execute(){
+
+if [ ${PLAT} = "ubuntu" ]; then
+
+  cd /tmp/
+  wget https://aws-codedeploy-${REGION}.s3.amazonaws.com/latest/install
+  chmod +x ./install
+
+  if ./install auto; then
+    echo "Instalation completed"
+      if ! ${AUTOUPDATE}; then
+            echo "Disabling Auto Update"
+            sed -i '/@reboot/d' /etc/cron.d/codedeploy-agent-update
+            chattr +i /etc/cron.d/codedeploy-agent-update
+            rm -f /tmp/install
+      fi
+    exit 0
+  else
+    echo "Instalation script failed, please investigate"
+    rm -f /tmp/install
+    exit 1
+  fi
+
+elif [ ${PLAT} = "amz" ]; then
+
+  cd /tmp/
+  wget https://aws-codedeploy-${REGION}.s3.amazonaws.com/latest/install
+  chmod +x ./install
+
+    if ./install auto; then
+      echo "Instalation completed"
+        if ! ${AUTOUPDATE}; then
+            echo "Disabling auto update"
+            sed -i '/@reboot/d' /etc/cron.d/codedeploy-agent-update
+            chattr +i /etc/cron.d/codedeploy-agent-update
+            rm -f /tmp/install
+        fi
+      exit 0
+    else
+      echo "Instalation script failed, please investigate"
+      rm -f /tmp/install
+      exit 1
+    fi
+
+else
+  echo "Unsupported platform ''${PLAT}''"
+fi
+
+}
+
+platformize
+installdep
+REGION=$(curl -s 169.254.169.254/latest/dynamic/instance-identity/document | jq -r ".region")
+execute
+              EOF
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+## Creating AutoScaling Group
+resource "aws_autoscaling_group" "tech-app-asg" {
+  launch_configuration = "${aws_launch_configuration.tech-app-lc.id}"
+  availability_zones = ["${data.aws_availability_zones.all.names}"]
+  min_size = 2
+  max_size = 4
+  load_balancers = ["${aws_elb.tech-app-lb.name}"]
+  health_check_type = "ELB"
+  vpc_zone_identifier  = [aws_subnet.app-subnet-1.id,aws_subnet.app-subnet-2.id]
+  tag {
+    key = "Name"
+    value = "ASG for Tech-App"
+    propagate_at_launch = true
+  }
+}
+
+## Security Group for ELB
+resource "aws_security_group" "tech-app-elb-sg" {
+  name = "Security Group for Tech App Load Balancer"
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  ingress {
+    from_port = 80
+    to_port = 80
+    protocol = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+### Creating ELB
+resource "aws_elb" "tech-app-elb" {
+  name = "Tech App Load Balancer"
+  security_groups = ["${aws_security_group.tech-app-elb-sg.id}"]
+  availability_zones = ["${data.aws_availability_zones.all.names}"]
+  health_check {
+    healthy_threshold = 2
+    unhealthy_threshold = 2
+    timeout = 3
+    interval = 30
+    target = "HTTP:3000/"
+  }
+  listener {
+    lb_port = 80
+    lb_protocol = "http"
+    instance_port = "3000"
+    instance_protocol = "http"
+  }
+}
+
+# Create Database Security Group
+resource "aws_security_group" "tech-app-db-sg" {
+  name        = "Tech App Database-SG"
+  description = "Allow inbound traffic from EC2 instances hosting Tech App"
+  vpc_id      = aws_vpc.tech-app-vpc.id
+
+  # Only allow entries from EC2 instance security group
+  ingress {
+    from_port = 5432
+    to_port = 5432
+    protocol = "tcp"
+    security_group_id= [aws_security_group.tech-app-sg.id]
+  }
+
+  # Allow all outbound traffic.
+  egress {
+    from_port = 0
+    to_port = 0
+    protocol = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+  tags = {
+    Name = "Database-SG"
+  }
+}
+
+## Create the postgresql database with Multi-AZ capability
+resource "aws_db_instance" "tech-app-db" {
+  allocated_storage      = 20
+  db_subnet_group_name   = aws_db_subnet_group.default.id
+  engine                 = "postgres"
+  engine_version         = "9.6.22"
+  instance_class         = "db.t2.micro"
+  multi_az               = true
+  name                   = "${var.database_name}"
+  username               = "${var.database_user}"
+  password               = "${var.database_password}"
+  skip_final_snapshot    = true
+  vpc_security_group_ids = [aws_security_group.database-sg.id]
+}
+
+resource "aws_db_subnet_group" "default" {
+  name       = "main"
+  subnet_ids = [aws_subnet.database-subnet-1.id, aws_subnet.database-subnet-2.id]
+
+  tags = {
+    Name = "My DB subnet group"
+  }
+}
+
+##################################################################################
+# OUTPUTS
+##################################################################################
+
+## Output the DNS name
+output "lb_dns_name" {
+  description = "The DNS name of the load balancer"
+  value       = aws_lb.tech-app-elb.dns_name
+}
